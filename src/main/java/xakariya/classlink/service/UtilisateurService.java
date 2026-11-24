@@ -54,7 +54,8 @@ public class UtilisateurService {
         if (existing.isEmpty()) {
             List<PreferenceNotification> defaults = new ArrayList<>();
             for (TypeNotification type : TypeNotification.values()) {
-                PreferenceNotification p = new PreferenceNotification(null, utilisateurId, type, true, false);
+                boolean defaultEmail = type != TypeNotification.NOUVEAU_COMMENTAIRE;
+                PreferenceNotification p = new PreferenceNotification(null, utilisateurId, type, true, defaultEmail);
                 defaults.add(preferenceRepository.save(p));
             }
             return defaults;
