@@ -52,13 +52,14 @@ public class UtilisateurService {
     public List<PreferenceNotification> getPreferences(String utilisateurId) {
         List<PreferenceNotification> existing = preferenceRepository.findByUtilisateurId(utilisateurId);
         if (existing.isEmpty()) {
-            List<PreferenceNotification> defaults = new ArrayList<>();
+            List<PreferenceNotification> created = new ArrayList<>();
             for (TypeNotification type : TypeNotification.values()) {
-                boolean defaultEmail = type != TypeNotification.NOUVEAU_COMMENTAIRE;
-                PreferenceNotification p = new PreferenceNotification(null, utilisateurId, type, true, defaultEmail);
-                defaults.add(preferenceRepository.save(p));
+                PreferenceNotification p = new PreferenceNotification();
+                p.setUtilisateurId(utilisateurId);
+                p.setType(type);
+                created.add(preferenceRepository.save(p));
             }
-            return defaults;
+            return created;
         }
         return existing;
     }

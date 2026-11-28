@@ -76,6 +76,7 @@ public class CommentaireService {
         }
 
         Publication publication = publicationRepository.findById(publicationId).orElseThrow();
+        Classe classe = classeRepository.findById(publication.getClasseId()).orElseThrow();
         Utilisateur auteur = utilisateurRepository.findById(auteurId).orElseThrow();
 
         Commentaire c = new Commentaire();
@@ -93,7 +94,7 @@ public class CommentaireService {
             notificationService.envoyerNotification(
                     publication.getAuteurId(),
                     publication.getClasseId(),
-                    "",
+                    classe.getNom(),
                     TypeNotification.NOUVEAU_COMMENTAIRE,
                     "Nouveau commentaire de " + auteur.getNomComplet(),
                     auteur.getNomComplet() + " a commenté : \"" + contenu + "\"",

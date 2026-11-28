@@ -82,7 +82,7 @@ public class RemiseService {
                 TypeNotification.NOUVELLE_REMISE,
                 "Nouvelle remise : " + etudiant.getNomComplet(),
                 etudiant.getNomComplet() + " a remis son devoir pour \"" + devoir.getTitre() + "\"",
-                "/assignments/" + devoirId
+                "/classes/" + classe.getId() + "?tab=WORK"
         );
 
         return saved;
@@ -133,7 +133,7 @@ public class RemiseService {
                 TypeNotification.NOTE_PUBLIEE,
                 "Note publiée pour \"" + devoir.getTitre() + "\"",
                 "Votre note : " + (note != null ? note + "/" + devoir.getBareme() : "corrigé"),
-                "/assignments/" + devoir.getId()
+                "/classes/" + classe.getId() + "?tab=GRADES"
         );
 
         return saved;

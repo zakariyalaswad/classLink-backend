@@ -1,5 +1,6 @@
 package xakariya.classlink.domain.model;
 
+import xakariya.classlink.domain.enums.EmailStatus;
 import xakariya.classlink.domain.enums.TypeNotification;
 
 import java.io.Serializable;
@@ -17,8 +18,17 @@ public class Notification implements Serializable {
     private LocalDateTime dateCreation;
     private LocalDateTime dateLecture;
 
+    // Automatic email delivery tracking fields
+    private EmailStatus emailStatus;
+    private String destinataireEmail;
+    private Integer emailAttempts;
+    private LocalDateTime emailSentAt;
+    private String emailError;
+
     public Notification() {
         this.dateCreation = LocalDateTime.now();
+        this.emailStatus = EmailStatus.PENDING;
+        this.emailAttempts = 0;
     }
 
     public String getId() {
@@ -99,5 +109,45 @@ public class Notification implements Serializable {
 
     public void setDateLecture(LocalDateTime dateLecture) {
         this.dateLecture = dateLecture;
+    }
+
+    public EmailStatus getEmailStatus() {
+        return emailStatus;
+    }
+
+    public void setEmailStatus(EmailStatus emailStatus) {
+        this.emailStatus = emailStatus;
+    }
+
+    public String getDestinataireEmail() {
+        return destinataireEmail;
+    }
+
+    public void setDestinataireEmail(String destinataireEmail) {
+        this.destinataireEmail = destinataireEmail;
+    }
+
+    public Integer getEmailAttempts() {
+        return emailAttempts;
+    }
+
+    public void setEmailAttempts(Integer emailAttempts) {
+        this.emailAttempts = emailAttempts;
+    }
+
+    public LocalDateTime getEmailSentAt() {
+        return emailSentAt;
+    }
+
+    public void setEmailSentAt(LocalDateTime emailSentAt) {
+        this.emailSentAt = emailSentAt;
+    }
+
+    public String getEmailError() {
+        return emailError;
+    }
+
+    public void setEmailError(String emailError) {
+        this.emailError = emailError;
     }
 }

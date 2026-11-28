@@ -33,8 +33,10 @@ public class AuthController {
     }
 
     @GetMapping("/me")
-    public ResponseEntity<?> me(@AuthenticationPrincipal(expression = "subject") String userId) {
-        return authService.getUtilisateurCourant(userId)
+    public ResponseEntity<?> me(@AuthenticationPrincipal Jwt jwt) {
+        String userId = jwt.getSubject();
+        String tokenEmail = jwt.getClaimAsString("email");
+        return authService.getUtilisateurCourant(userId, tokenEmail)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }

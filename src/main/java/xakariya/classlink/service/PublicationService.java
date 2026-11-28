@@ -117,7 +117,7 @@ public class PublicationService {
         notifierMembres(classe, enseignantId, TypeNotification.NOUVEAU_COURS,
                 "Nouveau cours : " + saved.getTitre(),
                 enseignant.getNomComplet() + " a publié un support de cours",
-                "/classes/" + classeId + "/travaux");
+                "/classes/" + classeId + "?tab=WORK");
 
         return saved;
     }
@@ -151,7 +151,7 @@ public class PublicationService {
         notifierMembres(classe, enseignantId, TypeNotification.NOUVEAU_DEVOIR,
                 "Nouveau devoir : " + saved.getTitre(),
                 "Un nouveau devoir à rendre avant le " + dateLimite + " est disponible",
-                "/assignments/" + saved.getId());
+                "/classes/" + classeId + "?tab=WORK");
 
         return saved;
     }
