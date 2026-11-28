@@ -104,9 +104,14 @@ class ClassLinkApiTest {
                 .andExpect(jsonPath("$.note").value(16.5));
         mvc.perform(get("/api/students/grades").with(as("student"))).andExpect(jsonPath("$", hasSize(1)));
 
-        // notifications read
+        // notifications read + test-email endpoint (unconfigured Resend key in test profile -> graceful FAILED response, 200 OK)
         mvc.perform(post("/api/notifications/mark-all-read").with(as("student"))).andExpect(status().isOk());
         mvc.perform(get("/api/notifications?unreadOnly=true").with(as("student"))).andExpect(jsonPath("$", hasSize(0)));
+        mvc.perform(post("/api/notifications/test-email").with(as("teacher")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.destinataireEmail").value("test-recipient@classlink.test"))
+                .andExpect(jsonPath("$.emailStatus").value("FAILED"))
+                .andExpect(jsonPath("$.emailError", containsString("RESEND_API_KEY")));
 
         // settings / archive / regenerate code
         json("teacher", "PUT", "/api/classes/" + classId + "/settings", "{\"publicationAnnonces\":\"ENSEIGNANTS\"}");

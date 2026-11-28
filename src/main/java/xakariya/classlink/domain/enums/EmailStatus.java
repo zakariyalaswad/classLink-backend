@@ -1,7 +1,7 @@
 package xakariya.classlink.domain.enums;
 
 /**
- * Tracks the automatic SMTP email delivery lifecycle for a notification.
+ * Tracks the automatic Resend email delivery lifecycle for a notification.
  */
 public enum EmailStatus {
     PENDING,

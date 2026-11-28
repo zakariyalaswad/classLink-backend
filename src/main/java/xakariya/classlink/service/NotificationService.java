@@ -27,7 +27,7 @@ public class NotificationService {
     private final PreferenceNotificationRepository preferenceRepository;
     private final UserEmailResolver userEmailResolver;
     private final EmailTemplateService emailTemplateService;
-    private final SmtpEmailSender smtpEmailSender;
+    private final ResendEmailSender resendEmailSender;
     private final String frontendUrl;
     private final int maxEmailRetries;
     private final String mailTestTo;
@@ -40,33 +40,33 @@ public class NotificationService {
                                PreferenceNotificationRepository preferenceRepository,
                                UserEmailResolver userEmailResolver,
                                EmailTemplateService emailTemplateService,
-                               SmtpEmailSender smtpEmailSender,
+                               ResendEmailSender resendEmailSender,
                                @Value("${app.frontend-url:http://localhost:4200}") String frontendUrl,
-                               @Value("${app.mail.max-retries:2}") int maxEmailRetries) {
-        this(notificationRepository, preferenceRepository, userEmailResolver,
-                emailTemplateService, smtpEmailSender, frontendUrl, maxEmailRetries, "");
+                               @Value("${app.mail.max-retries:2}") int maxEmailRetries,
+                               @Value("${app.mail.test-to:}") String mailTestTo) {
+        this.notificationRepository = notificationRepository;
+        this.preferenceRepository = preferenceRepository;
+        this.userEmailResolver = userEmailResolver;
+        this.emailTemplateService = emailTemplateService;
+        this.resendEmailSender = resendEmailSender;
+        this.frontendUrl = frontendUrl != null ? frontendUrl.trim() : "http://localhost:4200";
+        this.maxEmailRetries = Math.max(1, maxEmailRetries);
+        this.mailTestTo = mailTestTo != null ? mailTestTo.trim() : "";
     }
 
     public NotificationService(NotificationRepository notificationRepository,
                                PreferenceNotificationRepository preferenceRepository,
                                UserEmailResolver userEmailResolver,
                                EmailTemplateService emailTemplateService,
-                               SmtpEmailSender smtpEmailSender,
+                               ResendEmailSender resendEmailSender,
                                String frontendUrl,
-                               int maxEmailRetries,
-                               String mailTestTo) {
-        this.notificationRepository = notificationRepository;
-        this.preferenceRepository = preferenceRepository;
-        this.userEmailResolver = userEmailResolver;
-        this.emailTemplateService = emailTemplateService;
-        this.smtpEmailSender = smtpEmailSender;
-        this.frontendUrl = frontendUrl != null ? frontendUrl.trim() : "http://localhost:4200";
-        this.maxEmailRetries = Math.max(1, maxEmailRetries);
-        this.mailTestTo = mailTestTo != null ? mailTestTo.trim() : "";
+                               int maxEmailRetries) {
+        this(notificationRepository, preferenceRepository, userEmailResolver,
+                emailTemplateService, resendEmailSender, frontendUrl, maxEmailRetries, "");
     }
 
     /**
-     * Dispatches an in-app notification and automatically sends an email to the recipient.
+     * Dispatches an in-app notification and automatically sends an email to the recipient via Resend.
      * In-app notifications are persisted in Firebase Realtime Database first and are always
      * preserved even if email delivery fails.
      */
@@ -167,25 +167,28 @@ public class NotificationService {
             for (int attempt = 1; attempt <= maxEmailRetries; attempt++) {
                 attemptsMade = priorAttempts + attempt;
                 try {
-                    smtpEmailSender.sendHtmlEmail(toEmail, subject, htmlBody, textBody);
+                    String providerId = resendEmailSender.sendHtmlEmail(toEmail, subject, htmlBody, textBody);
                     notif.setEmailAttempts(attemptsMade);
                     notif.setEmailStatus(EmailStatus.SENT);
                     notif.setEmailSentAt(LocalDateTime.now());
                     notif.setEmailError(null);
                     Notification sentNotif = notificationRepository.save(notif);
-                    log.info("[EMAIL SENT] Notification [{}] envoyée à <{}> (tentative {})",
-                            notificationId, toEmail, attemptsMade);
+                    log.info("[EMAIL SENT] Notification [{}] envoyée via Resend (id={}) à <{}> (tentative {})",
+                            notificationId, providerId, toEmail, attemptsMade);
                     return sentNotif;
                 } catch (Exception e) {
                     lastError = e;
-                    // Do not retry if SMTP is simply unconfigured
-                    if (e instanceof IllegalStateException && e.getMessage() != null && e.getMessage().contains("SMTP non configuré")) {
+                    // Do not waste retry attempts on non-retryable configuration/auth/validation errors
+                    if (e instanceof ResendEmailSender.ResendDeliveryException rde && !rde.isRetryable()) {
+                        break;
+                    }
+                    if (e instanceof IllegalStateException) {
                         break;
                     }
                 }
             }
 
-            String sanitizedError = smtpEmailSender.sanitizeErrorMessage(lastError);
+            String sanitizedError = resendEmailSender.sanitizeErrorMessage(lastError);
             notif.setEmailAttempts(attemptsMade);
             notif.setEmailStatus(EmailStatus.FAILED);
             notif.setEmailError(sanitizedError);
@@ -234,7 +237,7 @@ public class NotificationService {
     }
 
     /**
-     * Sends a single SMTP smoke-test email to MAIL_TEST_TO (or the caller's resolved email)
+     * Sends a single Resend HTTPS API smoke-test email to MAIL_TEST_TO (or the caller's resolved email)
      * without broadcasting to other registered users.
      */
     public Notification sendSmokeTestEmail(String callerUid, String configuredTestTo) {
@@ -244,10 +247,10 @@ public class NotificationService {
 
         Notification probe = new Notification();
         probe.setUtilisateurId(callerUid);
-        probe.setNomClasse("Vérification SMTP");
+        probe.setNomClasse("Vérification Resend");
         probe.setType(TypeNotification.NOUVELLE_ANNONCE);
-        probe.setTitre("Test de livraison SMTP ClassLink");
-        probe.setMessage("Cet email confirme que la connexion et l'authentification SMTP de ClassLink fonctionnent.");
+        probe.setTitre("Test de livraison email ClassLink (Resend)");
+        probe.setMessage("Cet email confirme que l'envoi HTTPS via l'API Resend de ClassLink fonctionne.");
         probe.setLienCible("/notifications");
         probe.setDateCreation(LocalDateTime.now());
         probe.setDestinataireEmail(targetEmail);
@@ -265,16 +268,16 @@ public class NotificationService {
         String textBody = emailTemplateService.buildPlainTextEmail(probe, recipientName, frontendUrl);
 
         try {
-            smtpEmailSender.sendHtmlEmail(targetEmail, subject, htmlBody, textBody);
+            String messageId = resendEmailSender.sendHtmlEmail(targetEmail, subject, htmlBody, textBody);
             probe.setEmailStatus(EmailStatus.SENT);
             probe.setEmailSentAt(LocalDateTime.now());
             probe.setEmailError(null);
-            log.info("[SMTP SMOKE TEST SENT] Email de test accepté par le serveur SMTP pour <{}>", targetEmail);
+            log.info("[RESEND SMOKE TEST SENT] Email de test accepté par Resend (id={}) pour <{}>", messageId, targetEmail);
         } catch (Exception e) {
-            String sanitized = smtpEmailSender.sanitizeErrorMessage(e);
+            String sanitized = resendEmailSender.sanitizeErrorMessage(e);
             probe.setEmailStatus(EmailStatus.FAILED);
             probe.setEmailError(sanitized);
-            log.warn("[SMTP SMOKE TEST FAILED] Échec d'envoi vers <{}> : {}", targetEmail, sanitized);
+            log.warn("[RESEND SMOKE TEST FAILED] Échec d'envoi vers <{}> : {}", targetEmail, sanitized);
         }
         return probe;
     }

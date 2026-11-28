@@ -1,8 +1,10 @@
 package xakariya.classlink;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.mail.javamail.JavaMailSenderImpl;
 import xakariya.classlink.domain.enums.EmailStatus;
 import xakariya.classlink.domain.enums.RoleClasse;
 import xakariya.classlink.domain.enums.TypeNotification;
@@ -13,40 +15,37 @@ import xakariya.classlink.domain.model.Utilisateur;
 import xakariya.classlink.repository.*;
 import xakariya.classlink.service.*;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Comprehensive unit + embedded-SMTP integration tests covering all 14 notification & email requirements:
- * 1. Notification creation
- * 2. Firebase/DocumentStore persistence
- * 3. Correct recipient UID handling
- * 4. Firebase Authentication email lookup (DB, Inscription fallback, and Firebase Auth UID provider)
- * 5. Successful email sending (including real TCP SMTP server integration test)
- * 6. Missing recipient email
- * 7. Invalid recipient email
- * 8. SMTP authentication failure (and password masking)
- * 9. SMTP connection failure
- * 10. Duplicate email prevention
- * 11. Email status updates (PENDING -> SENT / FAILED)
- * 12. Retry behavior without duplicate in-app notifications
- * 13. Notification persistence when email sending fails
- * 14. Authorization and recipient validation
+ * Comprehensive unit, mocked-HTTPS, and embedded-HTTP integration tests for ClassLink notifications
+ * and Resend HTTPS Email API delivery:
+ * 1. Notification creation & DocumentStore persistence
+ * 2. Recipient email resolution (Utilisateur DB, Inscription fallback, Firebase Auth UID provider)
+ * 3. Successful HTTPS API delivery to https://api.resend.com/emails (port 443)
+ * 4. Missing & invalid recipient email handling
+ * 5. HTTP error handling: invalid API key (401/403), invalid sender address (local + 422), rate limits (429), 5xx, network/timeout
+ * 6. API key / Bearer token sanitization (never leaked in errors or logs)
+ * 7. Duplicate-send protection & retry behavior without duplicate notifications
+ * 8. Notification persistence when email delivery fails
+ * 9. Smoke-test email delivery via Resend (MAIL_TEST_TO)
+ * 10. Real Java HttpClient integration test against an embedded HTTP server
  */
 class NotificationEmailServiceTest {
 
+    private final ObjectMapper mapper = new ObjectMapper();
     private DocumentStore store;
     private NotificationRepository notificationRepository;
     private PreferenceNotificationRepository preferenceRepository;
@@ -75,41 +74,46 @@ class NotificationEmailServiceTest {
         return utilisateurRepository.save(u);
     }
 
-    /** Test double for SmtpEmailSender that records sent messages or simulates configurable failures. */
-    static class RecordingSmtpSender extends SmtpEmailSender {
-        record SentMail(String to, String subject, String html, String text) {}
-        final List<SentMail> sentMails = new CopyOnWriteArrayList<>();
-        final AtomicInteger sendCalls = new AtomicInteger(0);
-        RuntimeException failureToThrow = null;
+    record CapturedRequest(URI uri, Map<String, String> headers, String jsonBody) {}
 
-        RecordingSmtpSender(String password) {
-            super(Optional.empty(), "smtp.test.local", 587, "mailer@classlink.test", password, "mailer@classlink.test");
-        }
+    /** Mocked HTTPS transport capturing every request sent to https://api.resend.com/emails. */
+    static class MockResendHttpTransport implements ResendEmailSender.HttpTransport {
+        final List<CapturedRequest> requests = new CopyOnWriteArrayList<>();
+        final AtomicInteger callCount = new AtomicInteger(0);
+        volatile ResendEmailSender.HttpTransport delegate =
+                (uri, headers, body) -> new ResendEmailSender.HttpExchangeResult(200, "{\"id\":\"re_mock_12345\"}");
 
         @Override
-        public boolean isConfigured() {
-            return true;
-        }
-
-        @Override
-        public void sendHtmlEmail(String toEmail, String subject, String htmlBody, String plainTextBody) {
-            sendCalls.incrementAndGet();
-            if (failureToThrow != null) {
-                throw failureToThrow;
-            }
-            sentMails.add(new SentMail(toEmail, subject, htmlBody, plainTextBody));
+        public ResendEmailSender.HttpExchangeResult execute(URI uri, Map<String, String> headers, String jsonBody)
+                throws IOException, InterruptedException {
+            callCount.incrementAndGet();
+            requests.add(new CapturedRequest(uri, new LinkedHashMap<>(headers), jsonBody));
+            return delegate.execute(uri, headers, jsonBody);
         }
     }
 
     @Test
-    void createsNotificationPersistsInStoreAndSendsFormattedHtmlEmailToCorrectRecipient() {
+    void enforcesHttpsEndpointForNonLoopbackHosts() {
+        assertThrows(IllegalArgumentException.class, () ->
+                new ResendEmailSender("re_test_key_123456", "noreply@classlink.test", "http://api.resend.com/emails", null)
+        );
+    }
+
+    @Test
+    void createsNotificationPersistsInStoreAndDeliversEmailOverHttpsToResendApi() throws Exception {
         saveUser("teacher-1", "Alice", "Durand", "alice.teacher@classlink.test");
         saveUser("student-1", "Bob", "Martin", "bob.student@classlink.test");
 
-        RecordingSmtpSender smtp = new RecordingSmtpSender("secret-app-pwd");
+        MockResendHttpTransport transport = new MockResendHttpTransport();
+        ResendEmailSender sender = new ResendEmailSender(
+                "re_live_secretKey123456",
+                "noreply@classlink.edu",
+                ResendEmailSender.DEFAULT_RESEND_API_URL,
+                transport
+        );
         NotificationService service = new NotificationService(
                 notificationRepository, preferenceRepository, userEmailResolver,
-                emailTemplateService, smtp, "https://classlink.onrender.com", 2
+                emailTemplateService, sender, "https://classlink.onrender.com", 2
         );
 
         Notification created = service.envoyerNotification(
@@ -122,13 +126,11 @@ class NotificationEmailServiceTest {
                 "/classes/class-101?tab=WORK"
         );
 
-        // 1 & 2. Notification created and persisted in DocumentStore
         assertNotNull(created);
         assertNotNull(created.getId());
         Optional<Notification> fromDb = notificationRepository.findById(created.getId());
         assertTrue(fromDb.isPresent());
 
-        // 3 & 5 & 11. Sent to student-1's email (not teacher-1) and status updated to SENT
         assertEquals("student-1", fromDb.get().getUtilisateurId());
         assertEquals(EmailStatus.SENT, fromDb.get().getEmailStatus());
         assertEquals("bob.student@classlink.test", fromDb.get().getDestinataireEmail());
@@ -136,23 +138,34 @@ class NotificationEmailServiceTest {
         assertNotNull(fromDb.get().getEmailSentAt());
         assertNull(fromDb.get().getEmailError());
 
-        assertEquals(1, smtp.sentMails.size());
-        RecordingSmtpSender.SentMail mail = smtp.sentMails.get(0);
-        assertEquals("bob.student@classlink.test", mail.to());
-        assertEquals("[ClassLink - Architecture Logicielle] Nouveau devoir : TP Spring <script>alert(1)</script>", mail.subject());
+        assertEquals(1, transport.requests.size());
+        CapturedRequest req = transport.requests.get(0);
+        assertEquals("https", req.uri().getScheme());
+        assertEquals("api.resend.com", req.uri().getHost());
+        assertEquals(-1, req.uri().getPort()); // Default HTTPS port 443
+        assertEquals("/emails", req.uri().getPath());
+        assertEquals("Bearer re_live_secretKey123456", req.headers().get("Authorization"));
+        assertEquals("application/json", req.headers().get("Content-Type"));
 
-        // HTML template checks: branding, escaped HTML, action button URL
-        assertTrue(mail.html().contains("ClassLink"));
-        assertTrue(mail.html().contains("Bob Martin"));
-        assertTrue(mail.html().contains("Architecture Logicielle"));
-        assertTrue(mail.html().contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-        assertFalse(mail.html().contains("<script>alert(1)</script>"));
-        assertTrue(mail.html().contains("https://classlink.onrender.com/classes/class-101?tab=WORK"));
+        JsonNode payload = mapper.readTree(req.jsonBody());
+        assertEquals("ClassLink <noreply@classlink.edu>", payload.get("from").asText());
+        assertEquals("bob.student@classlink.test", payload.get("to").get(0).asText());
+        assertEquals("[ClassLink - Architecture Logicielle] Nouveau devoir : TP Spring <script>alert(1)</script>",
+                payload.get("subject").asText());
+
+        String html = payload.get("html").asText();
+        String text = payload.get("text").asText();
+        assertTrue(html.contains("ClassLink"));
+        assertTrue(html.contains("Bob Martin"));
+        assertTrue(html.contains("Architecture Logicielle"));
+        assertTrue(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assertFalse(html.contains("<script>alert(1)</script>"));
+        assertTrue(html.contains("https://classlink.onrender.com/classes/class-101?tab=WORK"));
+        assertTrue(text.contains("https://classlink.onrender.com/classes/class-101?tab=WORK"));
     }
 
     @Test
     void resolvesRecipientEmailViaInscriptionAndFirebaseAuthFallback() {
-        // Case A: User record has blank email, but Inscription has emailUtilisateur
         saveUser("uid-ins", "Claire", "Petit", "");
         Inscription ins = new Inscription();
         ins.setUtilisateurId("uid-ins");
@@ -164,10 +177,8 @@ class NotificationEmailServiceTest {
         Optional<String> fromIns = userEmailResolver.resolveEmailByUid("uid-ins");
         assertTrue(fromIns.isPresent());
         assertEquals("claire.petit@univ.fr", fromIns.get());
-        // Verify email was backfilled into Utilisateur record
         assertEquals("claire.petit@univ.fr", utilisateurRepository.findById("uid-ins").orElseThrow().getEmail());
 
-        // Case B: User record has no email in DB or Inscription, resolved via Firebase Auth UID lookup provider
         saveUser("uid-fb-auth", "David", "Moreau", null);
         userEmailResolver.setFirebaseAuthEmailProvider(uid ->
                 "uid-fb-auth".equals(uid) ? Optional.of("david.moreau@firebase.test") : Optional.empty()
@@ -184,13 +195,15 @@ class NotificationEmailServiceTest {
         saveUser("uid-no-email", "Sans", "Email", "");
         saveUser("uid-bad-email", "Bad", "Email", "not-an-email@@bad..com");
 
-        RecordingSmtpSender smtp = new RecordingSmtpSender("pwd");
+        MockResendHttpTransport transport = new MockResendHttpTransport();
+        ResendEmailSender sender = new ResendEmailSender(
+                "re_test_12345678", "ClassLink <noreply@classlink.edu>", ResendEmailSender.DEFAULT_RESEND_API_URL, transport
+        );
         NotificationService service = new NotificationService(
                 notificationRepository, preferenceRepository, userEmailResolver,
-                emailTemplateService, smtp, "http://localhost:4200", 2
+                emailTemplateService, sender, "http://localhost:4200", 2
         );
 
-        // 6. Missing recipient email
         Notification n1 = service.envoyerNotification(
                 "uid-no-email", "c1", "Maths", TypeNotification.NOUVELLE_ANNONCE,
                 "Annonce 1", "Contenu 1", "/classes/c1"
@@ -200,7 +213,6 @@ class NotificationEmailServiceTest {
         assertNotNull(n1.getEmailError());
         assertEquals(1, notificationRepository.findByUtilisateurId("uid-no-email").size());
 
-        // 7. Invalid recipient email
         Notification n2 = service.envoyerNotification(
                 "uid-bad-email", "c1", "Maths", TypeNotification.NOUVELLE_ANNONCE,
                 "Annonce 2", "Contenu 2", "/classes/c1"
@@ -208,21 +220,124 @@ class NotificationEmailServiceTest {
         assertNotNull(n2);
         assertEquals(EmailStatus.FAILED, n2.getEmailStatus());
         assertEquals(1, notificationRepository.findByUtilisateurId("uid-bad-email").size());
-        assertEquals(0, smtp.sendCalls.get());
+        assertEquals(0, transport.callCount.get());
     }
 
     @Test
-    void handlesSmtpAuthAndConnectionFailuresMasksPasswordAndSupportsRetryWithoutDuplicateNotifications() {
+    void handlesInvalidApiKeyInvalidSenderRateLimitsAndMasksSecrets() {
+        saveUser("student-err", "Sara", "Benali", "sara@classlink.test");
+
+        String secretApiKey = "re_SuperSecretResendKey987654321";
+        MockResendHttpTransport transport = new MockResendHttpTransport();
+
+        // A. Invalid API key (HTTP 401) containing key echo in error response -> non-retryable + masked
+        transport.delegate = (uri, headers, body) -> new ResendEmailSender.HttpExchangeResult(
+                401,
+                "{\"statusCode\":401,\"name\":\"invalid_api_key\",\"message\":\"API key " + secretApiKey + " is invalid\"}"
+        );
+        ResendEmailSender invalidKeySender = new ResendEmailSender(
+                secretApiKey, "ClassLink <noreply@classlink.edu>", ResendEmailSender.DEFAULT_RESEND_API_URL, transport
+        );
+        NotificationService serviceWithBadKey = new NotificationService(
+                notificationRepository, preferenceRepository, userEmailResolver,
+                emailTemplateService, invalidKeySender, "http://localhost:4200", 3
+        );
+
+        Notification authFailed = serviceWithBadKey.envoyerNotification(
+                "student-err", "c1", "Sécurité", TypeNotification.NOUVELLE_ANNONCE,
+                "Annonce Sécurité", "Contenu", "/classes/c1"
+        );
+        assertEquals(EmailStatus.FAILED, authFailed.getEmailStatus());
+        assertEquals(1, authFailed.getEmailAttempts()); // Non-retryable 401 stops after 1 attempt
+        assertFalse(authFailed.getEmailError().contains(secretApiKey));
+        assertTrue(authFailed.getEmailError().contains("***"));
+        assertFalse(invalidKeySender.toString().contains(secretApiKey));
+
+        // B. Invalid sender address (malformed MAIL_FROM) -> non-retryable, zero HTTP calls
+        MockResendHttpTransport badFromTransport = new MockResendHttpTransport();
+        ResendEmailSender invalidFromSender = new ResendEmailSender(
+                secretApiKey, "invalid-sender-format", ResendEmailSender.DEFAULT_RESEND_API_URL, badFromTransport
+        );
+        NotificationService serviceWithBadFrom = new NotificationService(
+                notificationRepository, preferenceRepository, userEmailResolver,
+                emailTemplateService, invalidFromSender, "http://localhost:4200", 2
+        );
+        Notification badFromNotif = serviceWithBadFrom.envoyerNotification(
+                "student-err", "c1", "Sécurité", TypeNotification.NOUVEAU_COURS,
+                "Cours 1", "Support", "/classes/c1"
+        );
+        assertEquals(EmailStatus.FAILED, badFromNotif.getEmailStatus());
+        assertEquals(1, badFromNotif.getEmailAttempts());
+        assertEquals(0, badFromTransport.callCount.get());
+        assertTrue(badFromNotif.getEmailError().contains("MAIL_FROM"));
+
+        // C. HTTP 422 unverified sender domain from Resend -> non-retryable, notification still persisted
+        MockResendHttpTransport unverifiedDomainTransport = new MockResendHttpTransport();
+        unverifiedDomainTransport.delegate = (uri, headers, body) -> new ResendEmailSender.HttpExchangeResult(
+                422,
+                "{\"statusCode\":422,\"name\":\"validation_error\",\"message\":\"The gmail.com domain is not verified.\"}"
+        );
+        ResendEmailSender unverifiedSender = new ResendEmailSender(
+                secretApiKey, "sender@gmail.com", ResendEmailSender.DEFAULT_RESEND_API_URL, unverifiedDomainTransport
+        );
+        NotificationService serviceUnverified = new NotificationService(
+                notificationRepository, preferenceRepository, userEmailResolver,
+                emailTemplateService, unverifiedSender, "http://localhost:4200", 2
+        );
+        Notification domainFailed = serviceUnverified.envoyerNotification(
+                "student-err", "c1", "Sécurité", TypeNotification.NOUVEAU_COURS,
+                "Cours 2", "Support", "/classes/c1"
+        );
+        assertEquals(EmailStatus.FAILED, domainFailed.getEmailStatus());
+        assertEquals(1, domainFailed.getEmailAttempts());
+        assertTrue(domainFailed.getEmailError().contains("422"));
+
+        // D. HTTP 429 rate limit on attempt 1 -> automatic retry succeeds on attempt 2!
+        MockResendHttpTransport rateLimitTransport = new MockResendHttpTransport();
+        AtomicInteger rlAttempt = new AtomicInteger(0);
+        rateLimitTransport.delegate = (uri, headers, body) -> {
+            if (rlAttempt.incrementAndGet() == 1) {
+                return new ResendEmailSender.HttpExchangeResult(
+                        429,
+                        "{\"statusCode\":429,\"name\":\"rate_limit_exceeded\",\"message\":\"Too many requests\"}"
+                );
+            }
+            return new ResendEmailSender.HttpExchangeResult(200, "{\"id\":\"re_after_ratelimit\"}");
+        };
+        ResendEmailSender rlSender = new ResendEmailSender(
+                secretApiKey, "ClassLink <noreply@classlink.edu>", ResendEmailSender.DEFAULT_RESEND_API_URL, rateLimitTransport
+        );
+        NotificationService rlService = new NotificationService(
+                notificationRepository, preferenceRepository, userEmailResolver,
+                emailTemplateService, rlSender, "http://localhost:4200", 2
+        );
+        Notification recoveredFrom429 = rlService.envoyerNotification(
+                "student-err", "c1", "Sécurité", TypeNotification.NOTE_PUBLIEE,
+                "Note", "19/20", "/classes/c1"
+        );
+        assertEquals(EmailStatus.SENT, recoveredFrom429.getEmailStatus());
+        assertEquals(2, recoveredFrom429.getEmailAttempts());
+        assertEquals(2, rateLimitTransport.callCount.get());
+
+        // All 4 notifications remain persisted in the store
+        assertEquals(4, notificationRepository.findByUtilisateurId("student-err").size());
+    }
+
+    @Test
+    void handlesNetworkFailuresSupportsManualRetryAndPreventsDuplicateSends() {
         saveUser("student-retry", "Lucas", "Bernard", "lucas@classlink.test");
 
-        String secretPassword = "SuperSecretGmailAppPassword123";
-        RecordingSmtpSender smtp = new RecordingSmtpSender(secretPassword);
-        // 8 & 9. Simulate SMTP auth/connection failure containing password in exception message
-        smtp.failureToThrow = new IllegalStateException("535 Authentication failed for password " + secretPassword);
+        MockResendHttpTransport transport = new MockResendHttpTransport();
+        transport.delegate = (uri, headers, body) -> {
+            throw new HttpTimeoutException("HTTPS connection timed out");
+        };
 
+        ResendEmailSender sender = new ResendEmailSender(
+                "re_test_retryKey123", "ClassLink <noreply@classlink.edu>", ResendEmailSender.DEFAULT_RESEND_API_URL, transport
+        );
         NotificationService service = new NotificationService(
                 notificationRepository, preferenceRepository, userEmailResolver,
-                emailTemplateService, smtp, "http://localhost:4200", 2
+                emailTemplateService, sender, "http://localhost:4200", 2
         );
 
         Notification failed = service.envoyerNotification(
@@ -230,33 +345,37 @@ class NotificationEmailServiceTest {
                 "Note publiée", "Votre note est 18/20", "/classes/c1?tab=GRADES"
         );
 
-        // 13. In-app notification is preserved even when SMTP fails
         assertNotNull(failed);
         assertEquals(EmailStatus.FAILED, failed.getEmailStatus());
-        assertEquals(2, failed.getEmailAttempts()); // retried maxEmailRetries (2) times
+        assertEquals(2, failed.getEmailAttempts()); // Retried maxEmailRetries (2) times
+        assertEquals(2, transport.callCount.get());
         assertNotNull(failed.getEmailError());
-        // Password must NEVER appear in stored error message
-        assertFalse(failed.getEmailError().contains(secretPassword));
-        assertTrue(failed.getEmailError().contains("***"));
         assertEquals(1, service.consulterNotifications("student-retry").size());
 
-        // 14. Authorization check: another user cannot retry this user's notification email
+        // Authorization check: another user cannot retry this user's notification email
         assertThrows(SecurityException.class, () -> service.retryFailedEmail(failed.getId(), "other-user-uid"));
 
-        // 12. Now SMTP recovers -> retryFailedEmail succeeds without creating a second in-app notification
-        smtp.failureToThrow = null;
+        // Network recovers (first ConnectException on attempt 1 of retry, then 200 OK on attempt 2!)
+        AtomicInteger recoveryStep = new AtomicInteger(0);
+        transport.delegate = (uri, headers, body) -> {
+            if (recoveryStep.incrementAndGet() == 1) {
+                throw new ConnectException("Transient network reset");
+            }
+            return new ResendEmailSender.HttpExchangeResult(200, "{\"id\":\"re_recovered_789\"}");
+        };
+
         Notification retried = service.retryFailedEmail(failed.getId(), "student-retry");
         assertEquals(EmailStatus.SENT, retried.getEmailStatus());
-        assertEquals(3, retried.getEmailAttempts());
+        assertEquals(4, retried.getEmailAttempts()); // 2 prior + 2 during recovery
         assertNull(retried.getEmailError());
         assertNotNull(retried.getEmailSentAt());
-        assertEquals(1, smtp.sentMails.size());
+        assertEquals(4, transport.callCount.get());
         assertEquals(1, service.consulterNotifications("student-retry").size());
 
-        // 10. Duplicate email prevention: calling deliverEmailForNotification again on a SENT notification does not send again
+        // Duplicate email prevention: calling deliverEmailForNotification or retryFailedEmail again does NOT send again
         service.deliverEmailForNotification(failed.getId());
         service.retryFailedEmail(failed.getId(), "student-retry");
-        assertEquals(1, smtp.sentMails.size());
+        assertEquals(4, transport.callCount.get());
     }
 
     @Test
@@ -266,10 +385,13 @@ class NotificationEmailServiceTest {
                 null, "student-pref", TypeNotification.NOUVEAU_COMMENTAIRE, true, false
         ));
 
-        RecordingSmtpSender smtp = new RecordingSmtpSender("pwd");
+        MockResendHttpTransport transport = new MockResendHttpTransport();
+        ResendEmailSender sender = new ResendEmailSender(
+                "re_test_prefKey123", "noreply@classlink.edu", ResendEmailSender.DEFAULT_RESEND_API_URL, transport
+        );
         NotificationService service = new NotificationService(
                 notificationRepository, preferenceRepository, userEmailResolver,
-                emailTemplateService, smtp, "http://localhost:4200", 1
+                emailTemplateService, sender, "http://localhost:4200", 1
         );
 
         Notification created = service.envoyerNotification(
@@ -279,90 +401,76 @@ class NotificationEmailServiceTest {
 
         assertNotNull(created);
         assertEquals(1, service.consulterNotifications("student-pref").size());
-        assertEquals(0, smtp.sentMails.size());
+        assertEquals(0, transport.callCount.get());
     }
 
     @Test
-    void deliversRealMimeEmailOverEmbeddedTcpSmtpServer() throws Exception {
-        saveUser("student-smtp", "Nadia", "Khelifi", "nadia@classlink.test");
+    void deliversRealHttpRequestUsingJavaHttpClientAndSmokeTestEndpoint() throws Exception {
+        saveUser("student-http", "Nadia", "Khelifi", "nadia@classlink.test");
 
-        CountDownLatch messageReceived = new CountDownLatch(1);
-        StringBuilder rawSmtpTranscript = new StringBuilder();
+        AtomicReference<String> capturedAuthHeader = new AtomicReference<>();
+        AtomicReference<String> capturedContentType = new AtomicReference<>();
+        AtomicReference<String> capturedBody = new AtomicReference<>();
+        AtomicInteger serverHits = new AtomicInteger(0);
 
-        try (ServerSocket serverSocket = new ServerSocket(0)) {
-            int port = serverSocket.getLocalPort();
-            Thread smtpServerThread = new Thread(() -> {
-                try (Socket client = serverSocket.accept();
-                     BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
-                     BufferedWriter out = new BufferedWriter(new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8))) {
-                    out.write("220 localhost ESMTP ClassLinkTestServer\r\n");
-                    out.flush();
-                    String line;
-                    boolean inData = false;
-                    while ((line = in.readLine()) != null) {
-                        rawSmtpTranscript.append(line).append("\n");
-                        if (inData) {
-                            if (".".equals(line)) {
-                                inData = false;
-                                out.write("250 2.0.0 OK: message queued\r\n");
-                                out.flush();
-                                messageReceived.countDown();
-                            }
-                            continue;
-                        }
-                        String upper = line.toUpperCase(Locale.ROOT);
-                        if (upper.startsWith("EHLO") || upper.startsWith("HELO")) {
-                            out.write("250-localhost\r\n250 OK\r\n");
-                            out.flush();
-                        } else if (upper.startsWith("MAIL FROM") || upper.startsWith("RCPT TO")) {
-                            out.write("250 OK\r\n");
-                            out.flush();
-                        } else if (upper.startsWith("DATA")) {
-                            inData = true;
-                            out.write("354 End data with <CR><LF>.<CR><LF>\r\n");
-                            out.flush();
-                        } else if (upper.startsWith("QUIT")) {
-                            out.write("221 Bye\r\n");
-                            out.flush();
-                            break;
-                        } else {
-                            out.write("250 OK\r\n");
-                            out.flush();
-                        }
-                    }
-                } catch (Exception ignored) {
-                }
-            });
-            smtpServerThread.setDaemon(true);
-            smtpServerThread.start();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/emails", exchange -> {
+            serverHits.incrementAndGet();
+            capturedAuthHeader.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            capturedContentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
+            capturedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
 
-            JavaMailSenderImpl realJavaMailSender = new JavaMailSenderImpl();
-            realJavaMailSender.setHost("localhost");
-            realJavaMailSender.setPort(port);
-            realJavaMailSender.setDefaultEncoding("UTF-8");
+            byte[] resp = "{\"id\":\"re_integration_ok_42\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, resp.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(resp);
+            }
+        });
+        server.start();
 
-            SmtpEmailSender realSmtpEmailSender = new SmtpEmailSender(
-                    Optional.of(realJavaMailSender), "localhost", port, "", "", "noreply@classlink.test"
+        try {
+            int port = server.getAddress().getPort();
+            String localApiUrl = "http://127.0.0.1:" + port + "/emails";
+
+            ResendEmailSender realHttpSender = new ResendEmailSender(
+                    "re_integrationKey_abcdef",
+                    "ClassLink <onboarding@resend.dev>",
+                    localApiUrl
             );
-
             NotificationService service = new NotificationService(
                     notificationRepository, preferenceRepository, userEmailResolver,
-                    emailTemplateService, realSmtpEmailSender, "http://localhost:4200", 1
+                    emailTemplateService, realHttpSender, "https://classlink-app.example.com", 1, "qa@classlink.test"
             );
 
+            // 1. Standard notification email over real HTTP socket
             Notification sent = service.envoyerNotification(
-                    "student-smtp", "class-42", "Informatique", TypeNotification.NOUVELLE_ANNONCE,
+                    "student-http", "class-42", "Informatique", TypeNotification.NOUVELLE_ANNONCE,
                     "Bienvenue en Informatique", "Le cours commence lundi à 9h.", "/classes/class-42"
             );
 
-            assertTrue(messageReceived.await(5, TimeUnit.SECONDS), "Embedded SMTP server should receive the email");
             assertEquals(EmailStatus.SENT, sent.getEmailStatus());
             assertEquals("nadia@classlink.test", sent.getDestinataireEmail());
+            assertEquals(1, serverHits.get());
+            assertEquals("Bearer re_integrationKey_abcdef", capturedAuthHeader.get());
+            assertEquals("application/json", capturedContentType.get());
 
-            String transcript = rawSmtpTranscript.toString();
-            assertTrue(transcript.contains("RCPT TO:<nadia@classlink.test>"));
-            assertTrue(transcript.contains("ClassLink"));
-            assertTrue(transcript.contains("Bienvenue en Informatique"));
+            JsonNode firstJson = mapper.readTree(capturedBody.get());
+            assertEquals("ClassLink <onboarding@resend.dev>", firstJson.get("from").asText());
+            assertEquals("nadia@classlink.test", firstJson.get("to").get(0).asText());
+            assertTrue(firstJson.get("html").asText().contains("Bienvenue en Informatique"));
+
+            // 2. Smoke-test email (MAIL_TEST_TO) over real HTTP socket
+            Notification smoke = service.sendSmokeTestEmail("student-http", "");
+            assertEquals(EmailStatus.SENT, smoke.getEmailStatus());
+            assertEquals("qa@classlink.test", smoke.getDestinataireEmail());
+            assertEquals(2, serverHits.get());
+
+            JsonNode smokeJson = mapper.readTree(capturedBody.get());
+            assertEquals("qa@classlink.test", smokeJson.get("to").get(0).asText());
+            assertTrue(smokeJson.get("subject").asText().contains("Resend"));
+        } finally {
+            server.stop(0);
         }
     }
 }
